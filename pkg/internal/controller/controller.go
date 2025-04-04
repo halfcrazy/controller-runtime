@@ -95,6 +95,9 @@ type Controller[request comparable] struct {
 
 	// LeaderElected indicates whether the controller is leader elected or always running.
 	LeaderElected *bool
+
+	// Worker scaling related fields
+	scaling *WorkerScalingContext
 }
 
 // Reconcile implements reconcile.Reconciler.
@@ -244,18 +247,9 @@ func (c *Controller[request]) Start(ctx context.Context) error {
 		// which won't be garbage collected if we hold a reference to it.
 		c.startWatches = nil
 
-		// Launch workers to process resources
-		c.LogConstructor(nil).Info("Starting workers", "worker count", c.MaxConcurrentReconciles)
-		wg.Add(c.MaxConcurrentReconciles)
-		for i := 0; i < c.MaxConcurrentReconciles; i++ {
-			go func() {
-				defer wg.Done()
-				// Run a worker thread that just dequeues items, processes them, and marks them done.
-				// It enforces that the reconcileHandler is never invoked concurrently with the same object.
-				for c.processNextWorkItem(ctx) {
-				}
-			}()
-		}
+		// Initialize worker management and start
+		c.initWorkerManagement()
+		c.startWorkerManager(ctx, wg)
 
 		c.Started = true
 		return nil

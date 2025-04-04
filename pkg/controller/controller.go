@@ -93,6 +93,18 @@ type TypedOptions[request comparable] struct {
 	//
 	// Note: This flag is disabled by default until a future version. It's currently in beta.
 	UsePriorityQueue *bool
+
+	// WorkerScaler is used to dynamically scale the number of workers based on metrics.
+	// If set, MinConcurrentReconciles and MaxConcurrentReconciles must also be set.
+	WorkerScaler WorkerScaler
+
+	// MinConcurrentReconciles is the minimum number of concurrent reconciles which can be run.
+	// Required if WorkerScaler is set. Defaults to MaxConcurrentReconciles if not set.
+	MinConcurrentReconciles int
+
+	// MaxConcurrentReconciles is the maximum number of concurrent reconciles which can be run.
+	// Required if WorkerScaler is set. Defaults to MaxConcurrentReconciles if not set.
+	MaxConcurrentReconcilesLimit int
 }
 
 // DefaultFromConfig defaults the config from a config.Controller
@@ -146,6 +158,34 @@ type TypedController[request comparable] interface {
 
 	// GetLogger returns this controller logger prefilled with basic information.
 	GetLogger() logr.Logger
+}
+
+// ScalableController extends TypedController to support dynamic worker scaling
+type ScalableController[request comparable] interface {
+	TypedController[request]
+
+	// SetWorkerScaler sets the scaler for dynamic worker count adjustment
+	// and configures minimum and maximum worker count limits
+	SetWorkerScaler(scaler WorkerScaler, minWorkers int, maxWorkers int)
+
+	// AdjustWorkers evaluates and adjusts worker count based on current conditions
+	AdjustWorkers(ctx context.Context) error
+}
+
+// AsScalableController attempts to convert a controller to a scalable controller.
+// Returns the ScalableController and true if the controller supports scaling,
+// otherwise returns nil and false.
+//
+// Example usage:
+//
+//	if sc, ok := controller.AsScalableController(ctrl); ok {
+//	    sc.AdjustWorkers(ctx)
+//	} else {
+//	    // Fallback to fixed number of workers
+//	}
+func AsScalableController[request comparable](c TypedController[request]) (ScalableController[request], bool) {
+	sc, ok := c.(ScalableController[request])
+	return sc, ok
 }
 
 // New returns a new Controller registered with the Manager.  The Manager will ensure that shared Caches have
@@ -243,7 +283,7 @@ func NewTypedUnmanaged[request comparable](name string, options TypedOptions[req
 	}
 
 	// Create controller with dependencies set
-	return &controller.Controller[request]{
+	ctrl := &controller.Controller[request]{
 		Do:                      options.Reconciler,
 		RateLimiter:             options.RateLimiter,
 		NewQueue:                options.NewQueue,
@@ -253,8 +293,50 @@ func NewTypedUnmanaged[request comparable](name string, options TypedOptions[req
 		LogConstructor:          options.LogConstructor,
 		RecoverPanic:            options.RecoverPanic,
 		LeaderElected:           options.NeedLeaderElection,
-	}, nil
+	}
+
+	// If WorkerScaler is specified, initialize worker scaling related settings
+	if options.WorkerScaler != nil {
+		minWorkers := options.MinConcurrentReconciles
+		if minWorkers <= 0 {
+			minWorkers = 1 // Need at least 1 worker
+		}
+
+		maxWorkers := options.MaxConcurrentReconcilesLimit
+		if maxWorkers <= 0 {
+			maxWorkers = options.MaxConcurrentReconciles // Default to MaxConcurrentReconciles as the upper limit
+		}
+
+		// Ensure minimum value is not greater than maximum value
+		if minWorkers > maxWorkers {
+			minWorkers = maxWorkers
+		}
+
+		// Create an adapter to convert between public and internal WorkerScaler interfaces
+		internalScaler := &workerScalerAdapter{
+			publicScaler: options.WorkerScaler,
+		}
+
+		// Set worker scaler
+		ctrl.SetWorkerScaler(internalScaler, minWorkers, maxWorkers)
+	}
+
+	return &typedControllerWrapper[request]{Controller: ctrl}, nil
 }
 
 // ReconcileIDFromContext gets the reconcileID from the current context.
 var ReconcileIDFromContext = controller.ReconcileIDFromContext
+
+type typedControllerWrapper[request comparable] struct {
+	*controller.Controller[request]
+}
+
+func (w *typedControllerWrapper[request]) SetWorkerScaler(scaler WorkerScaler, minWorkers int, maxWorkers int) {
+	internalScaler := &workerScalerAdapter{publicScaler: scaler}
+	w.Controller.SetWorkerScaler(internalScaler, minWorkers, maxWorkers)
+}
+
+// 确保typedControllerWrapper实现了AdjustWorkers方法
+func (w *typedControllerWrapper[request]) AdjustWorkers(ctx context.Context) error {
+	return w.Controller.AdjustWorkers(ctx)
+}

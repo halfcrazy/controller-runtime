@@ -38,6 +38,15 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/source"
 )
 
+// Define a simple test worker scaler
+type testWorkerScaler struct {
+	desiredWorkers int
+}
+
+func (s *testWorkerScaler) EvaluateWorkerCount(ctx context.Context, info controller.WorkerScalingInfo) (int, error) {
+	return s.desiredWorkers, nil
+}
+
 var _ = Describe("controller.Controller", func() {
 	rec := reconcile.Func(func(context.Context, reconcile.Request) (reconcile.Result, error) {
 		return reconcile.Result{}, nil
@@ -473,6 +482,165 @@ var _ = Describe("controller.Controller", func() {
 			q := ctrl.NewQueue("foo", nil)
 			_, ok = q.(priorityqueue.PriorityQueue[reconcile.Request])
 			Expect(ok).To(BeFalse())
+		})
+	})
+
+	Describe("WorkerScaling", func() {
+		var (
+			ctx    context.Context
+			cancel context.CancelFunc
+			ctrl   controller.Controller
+		)
+
+		BeforeEach(func() {
+			ctx, cancel = context.WithCancel(context.Background())
+
+			var err error
+			ctrl, err = controller.NewUnmanaged("test-worker-scaling", controller.Options{
+				Reconciler: reconcile.Func(func(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
+					// Simulate a reconciler that requires processing time
+					time.Sleep(50 * time.Millisecond)
+					return reconcile.Result{}, nil
+				}),
+				MaxConcurrentReconciles: 2, // Initially set to 2 workers
+			})
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		AfterEach(func() {
+			cancel()
+		})
+
+		It("should adjust workers based on scaler's evaluation", func() {
+			// 定义测试伸缩器
+			scaler := &testWorkerScaler{desiredWorkers: 4} // 测试目标是从2扩展到4
+
+			// 设置工作器伸缩器
+			sc, ok := controller.AsScalableController(ctrl)
+			Expect(ok).To(BeTrue())
+			sc.SetWorkerScaler(scaler, 1, 10)
+
+			// 启动控制器
+			go func() {
+				Expect(ctrl.Start(ctx)).To(Succeed())
+			}()
+
+			// 等待控制器初始化
+			time.Sleep(100 * time.Millisecond)
+
+			// 检查初始工作器数量
+			initialWorkers := 0
+			if c, ok := ctrl.(*internalcontroller.Controller[reconcile.Request]); ok {
+				initialWorkers = c.GetCurrentWorkerCount()
+			}
+
+			Expect(initialWorkers).To(Equal(2))
+
+			// 调整工作器数量
+			Expect(sc.AdjustWorkers(ctx)).To(Succeed())
+
+			// 等待工作器调整生效
+			time.Sleep(100 * time.Millisecond)
+
+			// 检查新工作器数量
+			adjustedWorkers := 0
+			if c, ok := ctrl.(*internalcontroller.Controller[reconcile.Request]); ok {
+				adjustedWorkers = c.GetCurrentWorkerCount()
+			}
+
+			Expect(adjustedWorkers).To(Equal(4))
+
+			// 测试减少工作器数量
+			scaler.desiredWorkers = 1
+
+			// 再次调整工作器数量
+			Expect(sc.AdjustWorkers(ctx)).To(Succeed())
+
+			// 等待工作器调整生效
+			time.Sleep(200 * time.Millisecond)
+
+			// 检查减少后的工作器数量
+			reducedWorkers := 0
+			if c, ok := ctrl.(*internalcontroller.Controller[reconcile.Request]); ok {
+				reducedWorkers = c.GetCurrentWorkerCount()
+			}
+
+			Expect(reducedWorkers).To(Equal(1))
+		})
+
+		It("should adjust workers based on scaler's evaluation periodically", func() {
+			// Define a simple test worker scaler
+			scaler := &testWorkerScaler{desiredWorkers: 4} // Test target is to scale from 2 to 4
+
+			// Set worker scaler
+			sc, ok := controller.AsScalableController(ctrl)
+			Expect(ok).To(BeTrue())
+			sc.SetWorkerScaler(scaler, 1, 10)
+
+			// Start controller
+			go func() {
+				Expect(ctrl.Start(ctx)).To(Succeed())
+			}()
+
+			// Wait for controller initialization
+			time.Sleep(100 * time.Millisecond)
+
+			// Check initial worker count
+			initialWorkers := 0
+			if c, ok := ctrl.(*internalcontroller.Controller[reconcile.Request]); ok {
+				initialWorkers = c.GetCurrentWorkerCount()
+			}
+
+			Expect(initialWorkers).To(Equal(2))
+
+			// Adjust worker count
+			Expect(sc.AdjustWorkers(ctx)).To(Succeed())
+
+			// Wait for worker adjustment to take effect
+			time.Sleep(100 * time.Millisecond)
+
+			// Check new worker count
+			adjustedWorkers := 0
+			if c, ok := ctrl.(*internalcontroller.Controller[reconcile.Request]); ok {
+				adjustedWorkers = c.GetCurrentWorkerCount()
+			}
+
+			Expect(adjustedWorkers).To(Equal(4))
+
+			// Test reducing worker count
+			scaler.desiredWorkers = 1
+
+			// Adjust worker count again
+			Expect(sc.AdjustWorkers(ctx)).To(Succeed())
+
+			// Wait for worker adjustment to take effect
+			time.Sleep(200 * time.Millisecond)
+
+			// Check reduced worker count
+			reducedWorkers := 0
+			if c, ok := ctrl.(*internalcontroller.Controller[reconcile.Request]); ok {
+				reducedWorkers = c.GetCurrentWorkerCount()
+			}
+
+			Expect(reducedWorkers).To(Equal(1))
+
+			// Periodically adjust workers
+			go func() {
+				ticker := time.NewTicker(5 * time.Second)
+				defer ticker.Stop()
+
+				for {
+					select {
+					case <-ticker.C:
+						// 每5秒评估并调整工作器数量
+						sc, ok := controller.AsScalableController(ctrl)
+						Expect(ok).To(BeTrue())
+						Expect(sc.AdjustWorkers(ctx)).To(Succeed())
+					case <-ctx.Done():
+						return
+					}
+				}
+			}()
 		})
 	})
 })
