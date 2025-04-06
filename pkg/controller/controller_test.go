@@ -494,9 +494,15 @@ var _ = Describe("controller.Controller", func() {
 
 		BeforeEach(func() {
 			ctx, cancel = context.WithCancel(context.Background())
+		})
 
+		AfterEach(func() {
+			cancel()
+		})
+
+		It("should adjust workers based on scaler's evaluation", func() {
 			var err error
-			ctrl, err = controller.NewUnmanaged("test-worker-scaling", controller.Options{
+			ctrl, err = controller.NewUnmanaged("test-worker-scaling1", controller.Options{
 				Reconciler: reconcile.Func(func(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
 					// Simulate a reconciler that requires processing time
 					time.Sleep(50 * time.Millisecond)
@@ -505,13 +511,6 @@ var _ = Describe("controller.Controller", func() {
 				MaxConcurrentReconciles: 2, // Initially set to 2 workers
 			})
 			Expect(err).NotTo(HaveOccurred())
-		})
-
-		AfterEach(func() {
-			cancel()
-		})
-
-		It("should adjust workers based on scaler's evaluation", func() {
 			// 定义测试伸缩器
 			scaler := &testWorkerScaler{desiredWorkers: 4} // 测试目标是从2扩展到4
 
@@ -526,29 +525,19 @@ var _ = Describe("controller.Controller", func() {
 			}()
 
 			// 等待控制器初始化
-			time.Sleep(100 * time.Millisecond)
+			time.Sleep(500 * time.Millisecond)
 
 			// 检查初始工作器数量
-			initialWorkers := 0
-			if c, ok := ctrl.(*internalcontroller.Controller[reconcile.Request]); ok {
-				initialWorkers = c.GetCurrentWorkerCount()
-			}
-
+			initialWorkers := sc.GetCurrentWorkerCount()
 			Expect(initialWorkers).To(Equal(2))
 
 			// 调整工作器数量
 			Expect(sc.AdjustWorkers(ctx)).To(Succeed())
 
 			// 等待工作器调整生效
-			time.Sleep(100 * time.Millisecond)
+			time.Sleep(500 * time.Millisecond)
 
-			// 检查新工作器数量
-			adjustedWorkers := 0
-			if c, ok := ctrl.(*internalcontroller.Controller[reconcile.Request]); ok {
-				adjustedWorkers = c.GetCurrentWorkerCount()
-			}
-
-			Expect(adjustedWorkers).To(Equal(4))
+			Expect(sc.GetCurrentWorkerCount()).To(Equal(4))
 
 			// 测试减少工作器数量
 			scaler.desiredWorkers = 1
@@ -557,18 +546,25 @@ var _ = Describe("controller.Controller", func() {
 			Expect(sc.AdjustWorkers(ctx)).To(Succeed())
 
 			// 等待工作器调整生效
-			time.Sleep(200 * time.Millisecond)
+			time.Sleep(500 * time.Millisecond)
 
 			// 检查减少后的工作器数量
-			reducedWorkers := 0
-			if c, ok := ctrl.(*internalcontroller.Controller[reconcile.Request]); ok {
-				reducedWorkers = c.GetCurrentWorkerCount()
-			}
+			reducedWorkers := sc.GetCurrentWorkerCount()
 
 			Expect(reducedWorkers).To(Equal(1))
 		})
 
 		It("should adjust workers based on scaler's evaluation periodically", func() {
+			var err error
+			ctrl, err = controller.NewUnmanaged("test-worker-scaling2", controller.Options{
+				Reconciler: reconcile.Func(func(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
+					// Simulate a reconciler that requires processing time
+					time.Sleep(50 * time.Millisecond)
+					return reconcile.Result{}, nil
+				}),
+				MaxConcurrentReconciles: 2, // Initially set to 2 workers
+			})
+			Expect(err).NotTo(HaveOccurred())
 			// Define a simple test worker scaler
 			scaler := &testWorkerScaler{desiredWorkers: 4} // Test target is to scale from 2 to 4
 

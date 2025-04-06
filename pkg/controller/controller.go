@@ -170,6 +170,9 @@ type ScalableController[request comparable] interface {
 
 	// AdjustWorkers evaluates and adjusts worker count based on current conditions
 	AdjustWorkers(ctx context.Context) error
+
+	// GetCurrentWorkerCount returns the current worker count
+	GetCurrentWorkerCount() int
 }
 
 // AsScalableController attempts to convert a controller to a scalable controller.
@@ -339,4 +342,9 @@ func (w *typedControllerWrapper[request]) SetWorkerScaler(scaler WorkerScaler, m
 // 确保typedControllerWrapper实现了AdjustWorkers方法
 func (w *typedControllerWrapper[request]) AdjustWorkers(ctx context.Context) error {
 	return w.Controller.AdjustWorkers(ctx)
+}
+
+// GetCurrentWorkerCount returns the current worker count
+func (w *typedControllerWrapper[request]) GetCurrentWorkerCount() int {
+	return w.Controller.GetCurrentWorkerCount()
 }

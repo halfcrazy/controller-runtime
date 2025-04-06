@@ -104,8 +104,9 @@ type WorkerScalingContext struct {
 	// Worker management related
 	workerSignalChan chan workerSignal
 	workerStopChan   chan uint64
-	activeWorkers    map[uint64]struct{}
-	nextWorkerID     uint64
+	//activeWorkers    map[uint64]struct{}
+	activeWorkers map[uint64]chan struct{}
+	nextWorkerID  uint64
 
 	// Mutex to protect worker scaling related operations
 	workerMu sync.Mutex
@@ -136,12 +137,13 @@ func (c *Controller[request]) initWorkerManagement() {
 
 	// Create and initialize WorkerScalingContext
 	c.scaling = &WorkerScalingContext{
-		minWorkers:              1,
-		maxWorkers:              c.MaxConcurrentReconciles,
-		workerSignalChan:        make(chan workerSignal, 10),
-		workerStopChan:          make(chan uint64, c.MaxConcurrentReconciles),
-		activeWorkers:           make(map[uint64]struct{}),
-		currentWorkers:          int32(c.MaxConcurrentReconciles),
+		minWorkers:       1,
+		maxWorkers:       c.MaxConcurrentReconciles,
+		workerSignalChan: make(chan workerSignal, 10),
+		workerStopChan:   make(chan uint64, c.MaxConcurrentReconciles),
+		//activeWorkers:           make(map[uint64]struct{}),
+		activeWorkers:           make(map[uint64]chan struct{}),
+		currentWorkers:          0,
 		processNextWorkItemFunc: c.processNextWorkItem,
 		controllerName:          c.Name,
 	}
@@ -174,71 +176,99 @@ func (c *Controller[request]) startWorkerManager(ctx context.Context, wg *sync.W
 	}
 }
 
-// handleWorkerSignal processes worker signals
 func (ws *WorkerScalingContext) handleWorkerSignal(ctx context.Context, wg *sync.WaitGroup, signal workerSignal) {
-	ws.workerMu.Lock()
-	defer ws.workerMu.Unlock()
-
-	// Get logger from context to preserve context information
-	log := log.FromContext(ctx)
+	logger := log.FromContext(ctx) // Get logger outside lock initially if needed
 
 	switch signal.action {
 	case WorkerStart:
-		ws.activeWorkers[signal.id] = struct{}{}
-		go ws.runWorker(ctx, wg, signal.id)
-		atomic.AddInt32(&ws.currentWorkers, 1)
-		log.V(1).Info("Worker started", "worker_id", signal.id, "current_workers", ws.currentWorkers)
-	case WorkerStop:
-		// Request to stop a worker
-		// Worker will send WorkerFinished signal after completing the current task
+		ws.workerMu.Lock() // Lock for map modification
+		logger.V(1).Info("Processing WorkerStart signal", "worker_id", signal.id)
 		if _, exists := ws.activeWorkers[signal.id]; exists {
-			ws.workerStopChan <- signal.id
-			log.V(1).Info("Worker stop requested", "worker_id", signal.id)
+			logger.Info("Attempted to start an already active worker", "worker_id", signal.id)
+			ws.workerMu.Unlock()
+			return
 		}
+		stopCh := make(chan struct{})
+		ws.activeWorkers[signal.id] = stopCh
+		ws.workerMu.Unlock() // Unlock before starting goroutine
+
+		go ws.runWorker(ctx, wg, signal.id, stopCh)
+
+		newCount := atomic.AddInt32(&ws.currentWorkers, 1)
+		logger.V(1).Info("Worker started", "worker_id", signal.id, "current_workers", newCount)
+
+	case WorkerStop:
+		ws.workerMu.Lock() // Lock for map modification
+		logger.V(1).Info("Processing WorkerStop signal", "worker_id", signal.id)
+		if stopCh, exists := ws.activeWorkers[signal.id]; exists {
+			close(stopCh)
+			delete(ws.activeWorkers, signal.id)
+			logger.V(1).Info("Worker stop requested and signaled", "worker_id", signal.id)
+		} else {
+			logger.V(1).Info("Worker stop requested for inactive/unknown worker", "worker_id", signal.id)
+		}
+		ws.workerMu.Unlock() // Unlock after processing
+
 	case WorkerFinished:
-		delete(ws.activeWorkers, signal.id)
-		atomic.AddInt32(&ws.currentWorkers, -1)
-		log.V(1).Info("Worker finished", "worker_id", signal.id, "current_workers", ws.currentWorkers)
+		logger.V(1).Info("Processing WorkerFinished signal", "worker_id", signal.id)
+		// *** Move atomic decrement BEFORE the lock ***
+		finalCount := atomic.AddInt32(&ws.currentWorkers, -1)
+		logger.V(1).Info("Worker count decremented", "worker_id", signal.id, "current_workers", finalCount) // Log count immediately
+
+		// Lock only for map cleanup
+		ws.workerMu.Lock()
+		if _, exists := ws.activeWorkers[signal.id]; exists {
+			delete(ws.activeWorkers, signal.id)
+			logger.V(2).Info("Removed finished worker from active map", "worker_id", signal.id)
+		} else {
+			// This is expected if the worker was explicitly stopped via WorkerStop before finishing
+			logger.V(2).Info("Finished worker already removed or not found in active map", "worker_id", signal.id)
+		}
+		ws.workerMu.Unlock()
+		// Log completion after potential map cleanup
+		logger.V(1).Info("Worker finished signal fully processed", "worker_id", signal.id)
+
+	default:
+		// Unknown action, log error
+		// No lock needed here as we aren't accessing shared state
+		logger.Error(fmt.Errorf("unknown worker action"), "Received unknown worker signal", "action", signal.action)
 	}
 }
 
 // runWorker runs a single worker
-func (ws *WorkerScalingContext) runWorker(ctx context.Context, wg *sync.WaitGroup, id uint64) {
+func (ws *WorkerScalingContext) runWorker(ctx context.Context, wg *sync.WaitGroup, id uint64, stopCh <-chan struct{}) {
 	wg.Add(1)
+	logger := log.FromContext(ctx)
 	defer func() {
 		wg.Done()
-		// Notify that worker has completed
+		// Send completion signal *unconditionally* on exit
 		ws.workerSignalChan <- workerSignal{id: id, action: WorkerFinished}
+		logger.V(1).Info("Worker routine finished", "worker_id", id)
 	}()
 
-	stopCh := make(chan struct{})
-
-	// Listen for stop signal
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				close(stopCh)
-				return
-			case workerID := <-ws.workerStopChan:
-				if workerID == id {
-					close(stopCh)
-					return
-				}
-			}
-		}
-	}()
-
-	// Process queue items until stop signal is received
 	for {
+		// Check stop signals first
 		select {
-		case <-stopCh:
+		case <-ctx.Done(): // Check global context cancellation
+			logger.V(1).Info("Worker stopping due to context cancellation", "worker_id", id)
+			return
+		case <-stopCh: // Check dedicated stop channel
+			logger.V(1).Info("Worker stopping due to stop request", "worker_id", id)
 			return
 		default:
-			if !ws.processNextWorkItemFunc(ctx) {
-				return
-			}
+			// No stop signal, proceed
 		}
+
+		// Attempt to process the next work item
+		logger.V(2).Info("Worker trying to process next item", "worker_id", id)
+		if !ws.processNextWorkItemFunc(ctx) {
+			// processNextWorkItemFunc returns false means queue is shutting down
+			logger.V(1).Info("Worker stopping because queue is shutting down", "worker_id", id)
+			return
+		}
+		// If processNextWorkItemFunc returns true, an item was processed
+		logger.V(2).Info("Worker processed an item", "worker_id", id)
+		// Loop continues, will check stop signals again first
 	}
 }
 
@@ -326,39 +356,66 @@ func (c *Controller[request]) AdjustWorkers(ctx context.Context) error {
 
 // setWorkerCount sets worker count
 func (ws *WorkerScalingContext) setWorkerCount(ctx context.Context, count int) error {
-	ws.workerMu.Lock()
-	defer ws.workerMu.Unlock()
+	// Collect signals while holding the lock
+	signalsToSend := []workerSignal{}
+	ws.workerMu.Lock() // Lock earlier
 
-	log := log.FromContext(ctx)
-	current := int(atomic.LoadInt32(&ws.currentWorkers))
-
-	log.V(1).Info("Adjusting worker count", "current", current, "target", count)
+	logger := log.FromContext(ctx)                       // Get logger within the lock scope
+	current := int(atomic.LoadInt32(&ws.currentWorkers)) // Read current count safely under lock
+	logger.V(1).Info("Planning worker count adjustment", "current", current, "target", count)
 
 	// Increase workers
 	if count > current {
-		for i := 0; i < count-current; i++ {
+		numToStart := count - current
+		logger.V(1).Info("Planning to start workers", "count", numToStart)
+		for i := 0; i < numToStart; i++ {
 			workerID := ws.nextWorkerID
 			ws.nextWorkerID++
-			ws.workerSignalChan <- workerSignal{id: workerID, action: WorkerStart}
+			// Prepare start signals but don't send yet
+			signalsToSend = append(signalsToSend, workerSignal{id: workerID, action: WorkerStart})
 		}
 	}
 
 	// Decrease workers
 	if count < current {
+		numToStop := current - count
+		logger.V(1).Info("Planning to stop workers", "count", numToStop)
 		// Find workers that can be stopped
 		var workersToStop []uint64
+		// Iterate safely over activeWorkers map under lock
 		for id := range ws.activeWorkers {
-			if len(workersToStop) < current-count {
+			if len(workersToStop) < numToStop {
 				workersToStop = append(workersToStop, id)
 			} else {
-				break
+				break // Found enough workers to stop
 			}
 		}
-
-		// Send stop signals
+		logger.V(1).Info("Identified workers to stop", "ids", workersToStop)
+		// Prepare stop signals but don't send yet
 		for _, id := range workersToStop {
-			ws.workerSignalChan <- workerSignal{id: id, action: WorkerStop}
+			signalsToSend = append(signalsToSend, workerSignal{id: id, action: WorkerStop})
 		}
+	}
+
+	ws.workerMu.Unlock() // *** Unlock BEFORE sending signals ***
+
+	// Send collected signals without holding the lock
+	if len(signalsToSend) > 0 {
+		logger.V(1).Info("Sending worker signals", "count", len(signalsToSend))
+		for _, signal := range signalsToSend {
+			// Use a select with context cancellation for robust sending
+			select {
+			case ws.workerSignalChan <- signal:
+				logger.V(2).Info("Sent worker signal", "id", signal.id, "action", signal.action)
+			case <-ctx.Done():
+				logger.Error(ctx.Err(), "Context cancelled while sending worker signal", "id", signal.id, "action", signal.action)
+				// If context is cancelled during signal sending, the overall operation might be incomplete.
+				// Returning error here is appropriate.
+				return fmt.Errorf("failed to send worker signal due to context cancellation: %w", ctx.Err())
+			}
+		}
+	} else {
+		logger.V(1).Info("No worker count adjustment needed or no signals to send.")
 	}
 
 	return nil
