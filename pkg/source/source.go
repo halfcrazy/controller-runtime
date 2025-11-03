@@ -90,12 +90,19 @@ func TypedKind[object client.Object, request comparable](
 	handler handler.TypedEventHandler[object, request],
 	predicates ...predicate.TypedPredicate[object],
 ) TypedSyncingSource[request] {
-	return &internal.Kind[object, request]{
+	// Automatically capture call stack here to help debug informer creation
+	// This happens in the user's goroutine, before any async boundaries
+	kind := &internal.Kind[object, request]{
 		Type:       obj,
 		Cache:      cache,
 		Handler:    handler,
 		Predicates: predicates,
 	}
+	
+	// Let the Kind capture its creation context
+	kind.CaptureCreationStack()
+	
+	return kind
 }
 
 var _ Source = &channel[string, reconcile.Request]{}

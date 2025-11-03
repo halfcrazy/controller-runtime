@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strings"
 	"time"
 
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -17,6 +18,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/internal/callerinfo"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 )
 
@@ -34,10 +36,44 @@ type Kind[object client.Object, request comparable] struct {
 
 	Predicates []predicate.TypedPredicate[object]
 
+	// creationStack stores the call stack from where this Kind was created
+	// This helps debug which controller/code created this informer
+	creationStack string
+	creationLocation string
+
 	// startedErr may contain an error if one was encountered during startup. If its closed and does not
 	// contain an error, startup and syncing finished.
 	startedErr  chan error
 	startCancel func()
+}
+
+// CaptureCreationStack captures the call stack at the point where this Kind was created.
+// This helps debug which controller/code triggered the informer creation, even across goroutine boundaries.
+// It only captures the stack if V(4) logging is enabled to avoid performance overhead in production.
+func (ks *Kind[object, request]) CaptureCreationStack() {
+	// Only capture stack if V(4) is enabled
+	if !logKind.V(4).Enabled() {
+		return
+	}
+	
+	// Skip 2 frames: Callers -> CaptureCreationStack
+	ks.creationStack = callerinfo.CaptureStack(2, 20)
+	
+	// Extract the first user code location from the stack
+	// The stack format is "func1:10 <- func2:20 <- ..."
+	parts := strings.Split(ks.creationStack, " <- ")
+	for _, part := range parts {
+		// Skip controller-runtime internal frames
+		if !strings.Contains(part, "sigs.k8s.io/controller-runtime/") && 
+		   !strings.Contains(part, "k8s.io/") {
+			ks.creationLocation = part
+			break
+		}
+	}
+	
+	if ks.creationLocation == "" {
+		ks.creationLocation = "unknown"
+	}
 }
 
 // Start is internal and should be called only by the Controller to register an EventHandler with the Informer
@@ -56,6 +92,13 @@ func (ks *Kind[object, request]) Start(ctx context.Context, queue workqueue.Type
 	// cache.GetInformer will block until its context is cancelled if the cache was already started and it can not
 	// sync that informer (most commonly due to RBAC issues).
 	ctx, ks.startCancel = context.WithCancel(ctx)
+	
+	// Add creation stack information to context to help debug informer creation
+	// This allows the informer to know where it was originally created, even across goroutine boundaries
+	if ks.creationStack != "" {
+		ctx = callerinfo.WithCallerInfoStack(ctx, ks.creationLocation, ks.creationStack)
+	}
+	
 	ks.startedErr = make(chan error, 1) // Buffer chan to not leak goroutines if WaitForSync isn't called
 	go func() {
 		var (
@@ -67,6 +110,7 @@ func (ks *Kind[object, request]) Start(ctx context.Context, queue workqueue.Type
 		// an error or the specified context is cancelled or expired.
 		if err := wait.PollUntilContextCancel(ctx, 10*time.Second, true, func(ctx context.Context) (bool, error) {
 			// Lookup the Informer from the Cache and add an EventHandler which populates the Queue
+			// The context now contains creation stack information
 			i, lastErr = ks.Cache.GetInformer(ctx, ks.Type)
 			if lastErr != nil {
 				kindMatchErr := &meta.NoKindMatchError{}

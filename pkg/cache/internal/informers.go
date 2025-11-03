@@ -39,6 +39,7 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
+	"sigs.k8s.io/controller-runtime/pkg/internal/callerinfo"
 	logf "sigs.k8s.io/controller-runtime/pkg/internal/log"
 	"sigs.k8s.io/controller-runtime/pkg/internal/syncs"
 )
@@ -301,7 +302,7 @@ func (ip *Informers) Get(ctx context.Context, gvk schema.GroupVersionKind, obj r
 	i, started, ok := ip.Peek(gvk, obj)
 	if !ok {
 		var err error
-		if i, started, err = ip.addInformerToMap(gvk, obj); err != nil {
+		if i, started, err = ip.addInformerToMap(ctx, gvk, obj); err != nil {
 			return started, nil, err
 		}
 	}
@@ -348,7 +349,30 @@ func (ip *Informers) informersByType(obj runtime.Object) map[schema.GroupVersion
 }
 
 // addInformerToMap either returns an existing informer or creates a new informer, adds it to the map and returns it.
-func (ip *Informers) addInformerToMap(gvk schema.GroupVersionKind, obj runtime.Object) (*Cache, bool, error) {
+func (ip *Informers) addInformerToMap(ctx context.Context, gvk schema.GroupVersionKind, obj runtime.Object) (*Cache, bool, error) {
+	// Debug log: who is creating this informer
+	if log.V(4).Enabled() {
+		callStack := callerinfo.CaptureStack(3, 50)
+		callerInfo, hasCallerInfo := callerinfo.GetCallerInfo(ctx)
+
+		if hasCallerInfo {
+			log.V(4).Info("Creating informer for GVK",
+				"gvk", gvk.String(),
+				"type", fmt.Sprintf("%T", obj),
+				"callStack", callStack,
+				"originStack", callerInfo.Stack,
+				"originLocation", callerInfo.Location,
+				"originTime", callerInfo.Timestamp.Format(time.RFC3339Nano),
+			)
+		} else {
+			log.V(4).Info("Creating informer for GVK",
+				"gvk", gvk.String(),
+				"type", fmt.Sprintf("%T", obj),
+				"callStack", callStack,
+			)
+		}
+	}
+
 	ip.mu.Lock()
 	defer ip.mu.Unlock()
 

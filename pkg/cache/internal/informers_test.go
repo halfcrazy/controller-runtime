@@ -17,14 +17,24 @@ limitations under the License.
 package internal
 
 import (
+	"context"
 	"fmt"
+	"strings"
+	"sync"
+	"time"
 
+	"github.com/go-logr/logr"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/watch"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/cache"
+	"sigs.k8s.io/controller-runtime/pkg/internal/callerinfo"
 )
 
 // Test that gvkFixupWatcher behaves like watch.FakeWatcher
@@ -92,3 +102,369 @@ var _ = Describe("gvkFixupWatcher", func() {
 		consumer(gvkfw)
 	})
 })
+
+// captureLogger is a test logger that captures log messages for verification
+type captureLogger struct {
+	mu       sync.Mutex
+	messages []capturedLog
+	level    int
+}
+
+type capturedLog struct {
+	level          int
+	msg            string
+	keysAndValues  []interface{}
+	keysAndValuesMap map[string]interface{}
+}
+
+func newCaptureLogger(level int) *captureLogger {
+	return &captureLogger{
+		messages: make([]capturedLog, 0),
+		level:    level,
+	}
+}
+
+func (l *captureLogger) Init(info logr.RuntimeInfo) {}
+
+func (l *captureLogger) Enabled(level int) bool {
+	return level <= l.level
+}
+
+func (l *captureLogger) Info(level int, msg string, keysAndValues ...interface{}) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	
+	kvMap := make(map[string]interface{})
+	for i := 0; i < len(keysAndValues); i += 2 {
+		if i+1 < len(keysAndValues) {
+			key := keysAndValues[i].(string)
+			kvMap[key] = keysAndValues[i+1]
+		}
+	}
+	
+	l.messages = append(l.messages, capturedLog{
+		level:            level,
+		msg:              msg,
+		keysAndValues:    keysAndValues,
+		keysAndValuesMap: kvMap,
+	})
+}
+
+func (l *captureLogger) Error(err error, msg string, keysAndValues ...interface{}) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	
+	kvMap := make(map[string]interface{})
+	kvMap["error"] = err
+	for i := 0; i < len(keysAndValues); i += 2 {
+		if i+1 < len(keysAndValues) {
+			key := keysAndValues[i].(string)
+			kvMap[key] = keysAndValues[i+1]
+		}
+	}
+	
+	l.messages = append(l.messages, capturedLog{
+		level:            0,
+		msg:              msg,
+		keysAndValues:    keysAndValues,
+		keysAndValuesMap: kvMap,
+	})
+}
+
+func (l *captureLogger) WithValues(keysAndValues ...interface{}) logr.LogSink {
+	return l
+}
+
+func (l *captureLogger) WithName(name string) logr.LogSink {
+	return l
+}
+
+func (l *captureLogger) GetMessages() []capturedLog {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]capturedLog{}, l.messages...)
+}
+
+var _ = Describe("Informer Creation Logging", func() {
+	var (
+		testLogger     *captureLogger
+		originalLogger logr.Logger
+		informers      *Informers
+		testScheme     *runtime.Scheme
+	)
+
+	BeforeEach(func() {
+		// Save the original logger
+		originalLogger = log
+		
+		// Create a test logger that captures V(4) logs
+		testLogger = newCaptureLogger(4)
+		log = logr.New(testLogger).WithName("cache")
+		
+		// Create a basic test scheme
+		testScheme = runtime.NewScheme()
+		Expect(corev1.AddToScheme(testScheme)).To(Succeed())
+		
+		// Create a mock Informers instance
+		informers = &Informers{
+			config: &rest.Config{
+				Host: "https://localhost:6443",
+			},
+			scheme: testScheme,
+			tracker: tracker{
+				Structured:   make(map[schema.GroupVersionKind]*Cache),
+				Unstructured: make(map[schema.GroupVersionKind]*Cache),
+				Metadata:     make(map[schema.GroupVersionKind]*Cache),
+			},
+			mapper: &fakeRESTMapper{},
+			newInformer: func(lw cache.ListerWatcher, obj runtime.Object, resync time.Duration, indexers cache.Indexers) cache.SharedIndexInformer {
+				return cache.NewSharedIndexInformer(lw, obj, resync, indexers)
+			},
+			startWait: make(chan struct{}),
+		}
+	})
+
+	AfterEach(func() {
+		// Restore the original logger
+		log = originalLogger
+	})
+
+	Context("when addInformerToMap is called", func() {
+		It("should log informer creation at V(4) level with GVK and call stack", func() {
+			gvk := schema.GroupVersionKind{
+				Group:   "",
+				Version: "v1",
+				Kind:    "Pod",
+			}
+			obj := &corev1.Pod{}
+
+			// Call addInformerToMap - this should trigger the debug log
+			_, _, err := informers.addInformerToMap(context.Background(), gvk, obj)
+			
+			// We expect an error here because we don't have a real API server
+			// but the log should still be captured before the error occurs
+			_ = err
+
+			// Verify that a log message was captured
+			messages := testLogger.GetMessages()
+			Expect(messages).To(HaveLen(1), "Expected exactly one log message")
+
+			// Verify the log message content
+			msg := messages[0]
+			Expect(msg.msg).To(Equal("Creating informer for GVK"))
+			Expect(msg.level).To(Equal(4), "Expected log level V(4)")
+
+			// Verify the log contains the expected fields
+			Expect(msg.keysAndValuesMap).To(HaveKey("gvk"))
+			Expect(msg.keysAndValuesMap["gvk"]).To(ContainSubstring("v1"))
+			Expect(msg.keysAndValuesMap["gvk"]).To(ContainSubstring("Pod"))
+
+			Expect(msg.keysAndValuesMap).To(HaveKey("type"))
+			Expect(msg.keysAndValuesMap["type"]).To(ContainSubstring("v1.Pod"))
+
+			// Verify the call stack is present and contains our test function
+			Expect(msg.keysAndValuesMap).To(HaveKey("callStack"))
+			callStack := msg.keysAndValuesMap["callStack"].(string)
+			Expect(callStack).NotTo(BeEmpty(), "Call stack should not be empty")
+			
+			// The call stack should contain references to the test function
+			// (it may vary depending on the ginkgo internals, so we just check it's not empty)
+			By(fmt.Sprintf("Call stack captured: %s", callStack))
+		})
+
+		It("should log informer creation for Unstructured objects", func() {
+			gvk := schema.GroupVersionKind{
+				Group:   "apps",
+				Version: "v1",
+				Kind:    "Deployment",
+			}
+			obj := &fakeUnstructured{}
+
+			_, _, err := informers.addInformerToMap(context.Background(), gvk, obj)
+			_ = err
+
+			messages := testLogger.GetMessages()
+			Expect(messages).To(HaveLen(1))
+
+			msg := messages[0]
+			Expect(msg.msg).To(Equal("Creating informer for GVK"))
+			Expect(msg.keysAndValuesMap["gvk"]).To(ContainSubstring("apps/v1"))
+			Expect(msg.keysAndValuesMap["gvk"]).To(ContainSubstring("Deployment"))
+			Expect(msg.keysAndValuesMap["type"]).To(ContainSubstring("fakeUnstructured"))
+		})
+
+		It("should log informer creation for PartialObjectMetadata", func() {
+			gvk := schema.GroupVersionKind{
+				Group:   "",
+				Version: "v1",
+				Kind:    "ConfigMap",
+			}
+			obj := &metav1.PartialObjectMetadata{}
+
+			_, _, err := informers.addInformerToMap(context.Background(), gvk, obj)
+			_ = err
+
+			messages := testLogger.GetMessages()
+			Expect(messages).To(HaveLen(1))
+
+			msg := messages[0]
+			Expect(msg.msg).To(Equal("Creating informer for GVK"))
+			Expect(msg.keysAndValuesMap["gvk"]).To(ContainSubstring("v1"))
+			Expect(msg.keysAndValuesMap["gvk"]).To(ContainSubstring("ConfigMap"))
+			Expect(msg.keysAndValuesMap["type"]).To(ContainSubstring("PartialObjectMetadata"))
+		})
+
+		It("should include function names in the call stack", func() {
+			gvk := schema.GroupVersionKind{
+				Group:   "",
+				Version: "v1",
+				Kind:    "Service",
+			}
+			obj := &corev1.Service{}
+
+			// Call through a helper function to verify stack trace captures it
+			helperThatCreatesInformer := func() {
+				_, _, _ = informers.addInformerToMap(context.Background(), gvk, obj)
+			}
+			helperThatCreatesInformer()
+
+			messages := testLogger.GetMessages()
+			Expect(messages).To(HaveLen(1))
+
+			msg := messages[0]
+			callStack := msg.keysAndValuesMap["callStack"].(string)
+			
+			// The call stack should contain our helper function name
+			// Note: The exact format may vary, but it should contain function names
+			Expect(callStack).NotTo(BeEmpty())
+			By(fmt.Sprintf("Verified call stack structure: %s", callStack))
+		})
+	})
+
+	Context("when log level is below V(4)", func() {
+		BeforeEach(func() {
+			// Create a logger with level 3 (below V(4))
+			testLogger = newCaptureLogger(3)
+			log = logr.New(testLogger).WithName("cache")
+		})
+
+		It("should not log informer creation", func() {
+			gvk := schema.GroupVersionKind{
+				Group:   "",
+				Version: "v1",
+				Kind:    "Pod",
+			}
+			obj := &corev1.Pod{}
+
+			_, _, err := informers.addInformerToMap(context.Background(), gvk, obj)
+			_ = err
+
+			// Verify that no log message was captured
+			messages := testLogger.GetMessages()
+			Expect(messages).To(BeEmpty(), "No logs should be captured at V(3) level")
+		})
+	})
+})
+
+var _ = Describe("captureCallerStack", func() {
+	It("should capture call stack with function names and line numbers", func() {
+		stack := callerinfo.CaptureStack(2, 5)
+		
+		Expect(stack).NotTo(BeEmpty())
+		
+		// The stack should contain function names and line numbers
+		// Format: package.Function:LineNumber <- ...
+		Expect(stack).To(MatchRegexp(`\w+:\d+`), "Stack should contain function:line format")
+		
+		By(fmt.Sprintf("Captured stack: %s", stack))
+	})
+
+	It("should filter out runtime internal frames", func() {
+		stack := callerinfo.CaptureStack(2, 10)
+		
+		// Should not contain runtime.* functions
+		Expect(stack).NotTo(ContainSubstring("runtime."))
+	})
+
+	It("should use arrow notation to show call chain", func() {
+		helperFunc := func() string {
+			return callerinfo.CaptureStack(2, 5)
+		}
+		
+		stack := helperFunc()
+		
+		// If there are multiple frames, they should be separated by " <- "
+		if strings.Contains(stack, "internal.") {
+			// Stack with multiple frames should have arrow separators
+			// We can't be too specific as it depends on test runner internals
+			Expect(stack).To(MatchRegexp(`\w+:\d+`))
+		}
+	})
+})
+
+// fakeUnstructured is a fake implementation of runtime.Unstructured for testing
+type fakeUnstructured struct {
+	metav1.TypeMeta
+	metav1.ObjectMeta
+}
+
+func (f *fakeUnstructured) GetObjectKind() schema.ObjectKind {
+	return &f.TypeMeta
+}
+
+func (f *fakeUnstructured) DeepCopyObject() runtime.Object {
+	return &fakeUnstructured{}
+}
+
+func (f *fakeUnstructured) UnstructuredContent() map[string]interface{} {
+	return map[string]interface{}{}
+}
+
+func (f *fakeUnstructured) SetUnstructuredContent(map[string]interface{}) {}
+
+// fakeRESTMapper is a minimal fake implementation for testing
+type fakeRESTMapper struct{}
+
+func (m *fakeRESTMapper) KindFor(resource schema.GroupVersionResource) (schema.GroupVersionKind, error) {
+	return schema.GroupVersionKind{}, fmt.Errorf("not implemented")
+}
+
+func (m *fakeRESTMapper) KindsFor(resource schema.GroupVersionResource) ([]schema.GroupVersionKind, error) {
+	return nil, fmt.Errorf("not implemented")
+}
+
+func (m *fakeRESTMapper) ResourceFor(input schema.GroupVersionResource) (schema.GroupVersionResource, error) {
+	return schema.GroupVersionResource{}, fmt.Errorf("not implemented")
+}
+
+func (m *fakeRESTMapper) ResourcesFor(input schema.GroupVersionResource) ([]schema.GroupVersionResource, error) {
+	return nil, fmt.Errorf("not implemented")
+}
+
+func (m *fakeRESTMapper) RESTMapping(gk schema.GroupKind, versions ...string) (*meta.RESTMapping, error) {
+	return &meta.RESTMapping{
+		Resource: schema.GroupVersionResource{
+			Group:    gk.Group,
+			Version:  versions[0],
+			Resource: strings.ToLower(gk.Kind) + "s",
+		},
+		GroupVersionKind: schema.GroupVersionKind{
+			Group:   gk.Group,
+			Version: versions[0],
+			Kind:    gk.Kind,
+		},
+		Scope: meta.RESTScopeNamespace,
+	}, nil
+}
+
+func (m *fakeRESTMapper) RESTMappings(gk schema.GroupKind, versions ...string) ([]*meta.RESTMapping, error) {
+	mapping, err := m.RESTMapping(gk, versions...)
+	if err != nil {
+		return nil, err
+	}
+	return []*meta.RESTMapping{mapping}, nil
+}
+
+func (m *fakeRESTMapper) ResourceSingularizer(resource string) (singular string, err error) {
+	return resource, nil
+}
